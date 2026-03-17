@@ -46,6 +46,7 @@ from verl.utils.rollout_trace import (
 )
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.arithmetic_sampling import get_arithmetic_code
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 
 logger = logging.getLogger(__file__)
@@ -493,37 +494,50 @@ class AgentLoopWorker:
             batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
 
         if "index" in batch.non_tensor_batch:
-            index = batch.non_tensor_batch["index"]
+            sample_keys = batch.non_tensor_batch["index"]
+        elif "uid" in batch.non_tensor_batch:
+            sample_keys = batch.non_tensor_batch["uid"]
         else:
-            index = np.arange(len(batch))
+            sample_keys = np.arange(len(batch))
+
+        rollout_ns = batch.non_tensor_batch.get("rollout_n")
 
         max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
 
         # For n rollouts per sample, we trace all n rollouts for selected samples
         # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
         if max_samples_per_worker is not None:
-            unique_sample_indices = np.unique(index)
+            unique_sample_indices = np.unique(sample_keys)
             if max_samples_per_worker < len(unique_sample_indices):
                 selected_samples = set(
                     np.random.choice(unique_sample_indices, max_samples_per_worker, replace=False).tolist()
                 )
-                traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
+                traced_indices = set(i for i in range(len(batch)) if sample_keys[i] in selected_samples)
             else:
                 traced_indices = set(range(len(batch)))
         else:
             traced_indices = set(range(len(batch)))
 
-        trajectory_info = await get_trajectory_info(
-            batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
+        trajectory_info = get_trajectory_info(
+            batch.meta_info.get("global_steps", -1),
+            sample_keys.tolist(),
+            batch.meta_info.get("validate", False),
+            rollout_ns.tolist() if rollout_ns is not None else None,
         )
 
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            request_sampling_params = self._maybe_apply_arithmetic_sampling(sampling_params, trajectory_info[i])
             tasks.append(
                 asyncio.create_task(
-                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                    self._run_agent_loop(
+                        request_sampling_params,
+                        trajectory_info[i],
+                        trace=trace_this_sample,
+                        **kwargs,
+                    )
                 )
             )
         outputs = await asyncio.gather(*tasks)
@@ -531,6 +545,40 @@ class AgentLoopWorker:
         output = self._postprocess(outputs, input_non_tensor_batch=batch.non_tensor_batch)
 
         return output
+
+    def _maybe_apply_arithmetic_sampling(
+        self, sampling_params: dict[str, Any], trajectory: dict[str, Any]
+    ) -> dict[str, Any]:
+        arithmetic_config = self.rollout_config.get("arithmetic_sampling", {}) or {}
+        if isinstance(arithmetic_config, dict):
+            arithmetic_enable = arithmetic_config.get("enable", False)
+            arithmetic_apply_to_validation = arithmetic_config.get("apply_to_validation", False)
+            arithmetic_group_size = arithmetic_config.get("group_size")
+            arithmetic_seed = arithmetic_config.get("seed", 0)
+        else:
+            arithmetic_enable = arithmetic_config.enable
+            arithmetic_apply_to_validation = arithmetic_config.apply_to_validation
+            arithmetic_group_size = arithmetic_config.group_size
+            arithmetic_seed = arithmetic_config.seed
+
+        if not arithmetic_enable:
+            return sampling_params
+        if trajectory["validate"] and not arithmetic_apply_to_validation:
+            return sampling_params
+
+        group_size = arithmetic_group_size
+        if group_size is None:
+            group_size = self.rollout_config.val_kwargs.n if trajectory["validate"] else self.rollout_config.n
+
+        request_sampling_params = dict(sampling_params)
+        extra_args = dict(request_sampling_params.get("extra_args") or {})
+        extra_args["arithmetic_code"] = get_arithmetic_code(
+            group_size=group_size,
+            seed=arithmetic_seed,
+            rollout_n=int(trajectory["rollout_n"]),
+        )
+        request_sampling_params["extra_args"] = extra_args
+        return request_sampling_params
 
     async def _run_agent_loop(
         self,
@@ -877,25 +925,54 @@ class AgentLoopWorker:
         )
 
 
-async def get_trajectory_info(step, index, validate):
+def _get_rollout_group_keys(non_tensor_batch: dict[str, np.ndarray]) -> list[Any]:
+    if "uid" in non_tensor_batch:
+        return non_tensor_batch["uid"].tolist()
+    if "index" in non_tensor_batch:
+        return non_tensor_batch["index"].tolist()
+    if not non_tensor_batch:
+        return []
+    first_key = next(iter(non_tensor_batch))
+    return list(range(len(non_tensor_batch[first_key])))
+
+
+def compute_rollout_n(group_keys: list[Any]) -> list[int]:
+    rollout_ns = []
+    rollout_n = 0
+    for i, group_key in enumerate(group_keys):
+        if i > 0 and group_keys[i - 1] == group_key:
+            rollout_n += 1
+        else:
+            rollout_n = 0
+        rollout_ns.append(rollout_n)
+    return rollout_ns
+
+
+def get_trajectory_info(step, sample_keys, validate, rollout_ns=None):
     """Get trajectory info.
 
     Args:
         step (int): global steps in the trainer.
-        index (list): form datastore extra_info.index column.
+        sample_keys (list): stable group key for each prompt, usually uid or dataset index.
         validate (bool): whether is a validate step.
+        rollout_ns (list, optional): precomputed rollout slot inside each repeated group.
 
     Returns:
         list: trajectory.
     """
+    if rollout_ns is None:
+        rollout_ns = compute_rollout_n(sample_keys)
+
     trajectory_info = []
-    rollout_n = 0
-    for i in range(len(index)):
-        if i > 0 and index[i - 1] == index[i]:
-            rollout_n += 1
-        else:
-            rollout_n = 0
-        trajectory_info.append({"step": step, "sample_index": index[i], "rollout_n": rollout_n, "validate": validate})
+    for i, sample_key in enumerate(sample_keys):
+        trajectory_info.append(
+            {
+                "step": step,
+                "sample_index": sample_key,
+                "rollout_n": int(rollout_ns[i]),
+                "validate": validate,
+            }
+        )
     return trajectory_info
 
 
@@ -1037,6 +1114,12 @@ class AgentLoopManager:
             DataProto: Output batch.
         """
 
+        if "rollout_n" not in prompts.non_tensor_batch:
+            prompts.non_tensor_batch["rollout_n"] = np.array(
+                compute_rollout_n(_get_rollout_group_keys(prompts.non_tensor_batch)),
+                dtype=np.int32,
+            )
+
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(
             *[
@@ -1045,6 +1128,7 @@ class AgentLoopManager:
             ]
         )
         output = DataProto.concat(outputs)
+        output.non_tensor_batch.pop("rollout_n", None)
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]

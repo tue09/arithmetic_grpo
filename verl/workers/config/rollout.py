@@ -22,6 +22,7 @@ from verl.utils.profiler import ProfilerConfig
 from verl.workers.config.model import MtpConfig
 
 __all__ = [
+    "ArithmeticSamplingConfig",
     "SamplingConfig",
     "MultiTurnConfig",
     "CustomAsyncServerConfig",
@@ -32,6 +33,33 @@ __all__ = [
     "RolloutConfig",
     "CheckpointEngineConfig",
 ]
+
+
+@dataclass
+class ArithmeticSamplingConfig(BaseConfig):
+    enable: bool = False
+    group_size: Optional[int] = None
+    seed: int = 0
+    apply_to_validation: bool = False
+
+    def __post_init__(self):
+        if self.group_size is not None and self.group_size < 1:
+            raise ValueError("`group_size` must be a positive integer or null.")
+
+
+def _coerce_arithmetic_sampling_config(value) -> ArithmeticSamplingConfig:
+    if value is None:
+        return ArithmeticSamplingConfig()
+    if isinstance(value, ArithmeticSamplingConfig):
+        return value
+    if isinstance(value, dict):
+        return ArithmeticSamplingConfig(**value)
+    return ArithmeticSamplingConfig(
+        enable=getattr(value, "enable", False),
+        group_size=getattr(value, "group_size", None),
+        seed=getattr(value, "seed", 0),
+        apply_to_validation=getattr(value, "apply_to_validation", False),
+    )
 
 
 @dataclass
@@ -208,6 +236,8 @@ class RolloutConfig(BaseConfig):
     # Extension point for custom configurations
     custom: Optional[dict] = None
 
+    arithmetic_sampling: ArithmeticSamplingConfig = field(default_factory=ArithmeticSamplingConfig)
+
     # Checkpoint Engine config for update weights from trainer to rollout
     checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
 
@@ -247,6 +277,12 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        object.__setattr__(
+            self,
+            "arithmetic_sampling",
+            _coerce_arithmetic_sampling_config(getattr(self, "arithmetic_sampling", None)),
+        )
+
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(

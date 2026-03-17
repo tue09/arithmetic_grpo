@@ -409,6 +409,29 @@ class vLLMHttpServer:
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
 
+        arithmetic_sampling = self.config.get("arithmetic_sampling", {}) or {}
+        arithmetic_enable = (
+            arithmetic_sampling.get("enable", False)
+            if isinstance(arithmetic_sampling, dict)
+            else arithmetic_sampling.enable
+        )
+        arithmetic_group_size = (
+            arithmetic_sampling.get("group_size")
+            if isinstance(arithmetic_sampling, dict)
+            else arithmetic_sampling.group_size
+        )
+        arithmetic_seed = arithmetic_sampling.get("seed", 0) if isinstance(arithmetic_sampling, dict) else arithmetic_sampling.seed
+
+        if arithmetic_enable:
+            args["logits_processors"] = [
+                "verl.workers.rollout.vllm_rollout.arithmetic:ArithmeticSamplingProcessor"
+            ]
+            logger.info(
+                "Enabled arithmetic sampling logits processor with group_size=%s seed=%s",
+                arithmetic_group_size,
+                arithmetic_seed,
+            )
+
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
         if self.replica_rank == 0:

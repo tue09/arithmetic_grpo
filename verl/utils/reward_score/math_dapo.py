@@ -235,6 +235,13 @@ def verify(
         correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
         return correct == 1, pred
 
+    # Prefer the final boxed answer when present, since many math prompts
+    # instruct the model to end with \boxed{...}. Fall back to the
+    # "Answer: ..." extraction only when no boxed answer exists.
+    correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
+    if pred is not None:
+        return correct == 1, pred
+
     correct, pred = is_correct_minerva(solution_str, answer)
     return correct, pred
 

@@ -65,6 +65,10 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
+VALIDATION_DATA_SOURCE_GROUPS = {
+    "aime23_24_25": ("aime23", "aime24", "aime25"),
+}
+
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
@@ -626,6 +630,23 @@ class RayPPOTrainer:
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        data_sources = np.asarray(data_sources, dtype=object)
+        sample_uids = np.asarray(sample_uids, dtype=object)
+
+        for group_name, members in VALIDATION_DATA_SOURCE_GROUPS.items():
+            group_indices = [idx for idx, data_source in enumerate(data_sources) if data_source in members]
+            if not group_indices:
+                continue
+
+            grouped_data_sources = np.full(len(group_indices), group_name, dtype=object)
+            grouped_sample_uids = [f"{data_sources[idx]}::{sample_uids[idx]}" for idx in group_indices]
+            grouped_infos_dict = {
+                key: [values[idx] for idx in group_indices] for key, values in reward_extra_infos_dict.items()
+            }
+            grouped_metrics = process_validation_metrics(grouped_data_sources, grouped_sample_uids, grouped_infos_dict)
+            if group_name in grouped_metrics:
+                data_src2var2metric2val[group_name] = grouped_metrics[group_name]
+
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"

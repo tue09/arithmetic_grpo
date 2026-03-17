@@ -1,0 +1,21 @@
+{
+  "data_source": "aime_history",
+  "prompt": [
+    {
+      "content": "Let $x$ , $y$ and $z$ all exceed $1$ and let $w$ be a positive number such that $\\log_xw=24$ , $\\log_y w = 40$ and $\\log_{xyz}w=12$ . Find $\\log_zw$ . Let's think step by step and output the final answer within \\boxed{}.",
+      "role": "user"
+    }
+  ],
+  "ability": "math",
+  "reward_model": {
+    "ground_truth": "60",
+    "style": "rule"
+  },
+  "extra_info": {
+    "index": 0,
+    "problem_number": 1,
+    "question": "Let $x$ , $y$ and $z$ all exceed $1$ and let $w$ be a positive number such that $\\log_xw=24$ , $\\log_y w = 40$ and $\\log_{xyz}w=12$ . Find $\\log_zw$ .",
+    "split": "train",
+    "year": 1983
+  }
+}

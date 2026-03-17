@@ -1,0 +1,21 @@
+{
+  "data_source": "aime23",
+  "prompt": [
+    {
+      "content": "Five men and nine women stand equally spaced around a circle in random order. The probability that every man stands diametrically opposite a woman is $\\frac{m}{n},$ where $m$ and $n$ are relatively prime positive integers. Find $m+n.$ Let's think step by step and output the final answer within \\boxed{}.",
+      "role": "user"
+    }
+  ],
+  "ability": "math",
+  "reward_model": {
+    "ground_truth": "191",
+    "style": "rule"
+  },
+  "extra_info": {
+    "index": 0,
+    "problem_number": 1,
+    "question": "Five men and nine women stand equally spaced around a circle in random order. The probability that every man stands diametrically opposite a woman is $\\frac{m}{n},$ where $m$ and $n$ are relatively prime positive integers. Find $m+n.$",
+    "split": "test",
+    "year": 2023
+  }
+}
