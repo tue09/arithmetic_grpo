@@ -130,14 +130,15 @@ fi
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name="$WANDB_PROJECT" \
-    trainer.experiment_name="${WANDB_RUN_NAME:-qwen3_4b_grpo_math_4gpu}" \
+    trainer.experiment_name="${WANDB_RUN_NAME:-qwen3_4b_grpo_math_4gpu_clip_ratio_high_0.24}" \
     trainer.default_local_dir="$CHECKPOINT_DIR" \
     trainer.resume_mode=${RESUME_MODE:-disable} \
     +ray_kwargs.ray_init._temp_dir="$RAY_TMP_DIR" \
     +ray_kwargs.ray_init.object_spilling_directory="$RAY_SPILL_DIR" \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=${SAVE_FREQ:-50} \
+    trainer.save_freq=${SAVE_FREQ:-500} \
     trainer.test_freq=${TEST_FREQ:-5} \
-    trainer.total_epochs=${TOTAL_EPOCHS:-15} \
+    trainer.total_epochs=${TOTAL_EPOCHS:-20} \
+    trainer.total_training_steps=${TOTAL_TRAINING_STEPS:-2000} \
     "$@"

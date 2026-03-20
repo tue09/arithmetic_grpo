@@ -22,6 +22,7 @@ from verl.trainer.config import AlgoConfig, KLControlConfig
 from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
+    compute_qae_outcome_advantage,
     get_adv_estimator_fn,
 )
 from verl.utils.config import omega_conf_to_dataclass
@@ -39,6 +40,8 @@ class TestAlgoConfig(unittest.TestCase):
             "lam": 0.95,
             "adv_estimator": "gae",
             "norm_adv_by_std_in_grpo": True,
+            "qae_quantile": 0.4,
+            "qae_norm_by_std": True,
             "use_kl_in_reward": True,
             "kl_penalty": "kl",
             "kl_ctrl": {
@@ -62,6 +65,8 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertEqual(config.lam, 0.95)
         self.assertEqual(config.adv_estimator, "gae")
         self.assertTrue(config.norm_adv_by_std_in_grpo)
+        self.assertEqual(config.qae_quantile, 0.4)
+        self.assertTrue(config.qae_norm_by_std)
         self.assertTrue(config.use_kl_in_reward)
         self.assertEqual(config.kl_penalty, "kl")
         self.assertTrue(config.use_pf_ppo)
@@ -98,6 +103,8 @@ class TestAlgoConfig(unittest.TestCase):
         self.assertEqual(config.lam, 1.0)  # default value
         self.assertEqual(config.adv_estimator, "gae")  # default value
         self.assertTrue(config.norm_adv_by_std_in_grpo)  # default value
+        self.assertEqual(config.qae_quantile, 0.4)  # default value
+        self.assertTrue(config.qae_norm_by_std)  # default value
         self.assertFalse(config.use_kl_in_reward)  # default value
         self.assertEqual(config.kl_penalty, "kl")  # default value
         self.assertFalse(config.use_pf_ppo)  # default value
@@ -147,6 +154,8 @@ class TestAlgoCompute(unittest.TestCase):
             lam=0.95,
             adv_estimator="gae",
             norm_adv_by_std_in_grpo=True,
+            qae_quantile=0.4,
+            qae_norm_by_std=True,
             use_kl_in_reward=True,
             kl_penalty="kl",
             kl_ctrl=KLControlConfig(type="adaptive", kl_coef=0.002, horizon=5000, target_kl=0.05),
@@ -198,6 +207,26 @@ class TestAlgoCompute(unittest.TestCase):
 
         self.assertEqual(advantages.shape, (batch_size, seq_len))
         self.assertEqual(returns.shape, (batch_size, seq_len))
+
+    def test_qae_advantage_estimator_with_cfg(self):
+        """Test integration with QAE advantage estimator."""
+        qae_config = AlgoConfig(adv_estimator="QAE", qae_quantile=0.4, qae_norm_by_std=True)
+
+        batch_size, seq_len = 4, 2
+        token_level_rewards = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 0.0], [1.0, 0.0]])
+        response_mask = torch.ones(batch_size, seq_len)
+        index = np.array([0, 0, 1, 1])
+
+        advantages, returns = compute_qae_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=index,
+            config=qae_config,
+        )
+
+        self.assertEqual(advantages.shape, (batch_size, seq_len))
+        self.assertEqual(returns.shape, (batch_size, seq_len))
+        self.assertTrue(torch.allclose(advantages, returns))
 
 
 if __name__ == "__main__":

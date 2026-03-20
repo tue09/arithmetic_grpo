@@ -24,6 +24,7 @@ from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
+    compute_qae_outcome_advantage,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     get_adv_estimator_fn,
@@ -38,6 +39,7 @@ def mock_test_fn():
 class TestRegisterAdvEst(unittest.TestCase):
     def setUp(self):
         """Clear the registry before each test"""
+        self._original_registry = verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.copy()
         verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.clear()
         verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY = {
             "gae": lambda x: x * 2,
@@ -47,6 +49,7 @@ class TestRegisterAdvEst(unittest.TestCase):
 
     def tearDown(self) -> None:
         verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.clear()
+        verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.update(self._original_registry)
         return super().tearDown()
 
     def test_register_new_function(self):
@@ -138,6 +141,15 @@ class TestRegisterAdvEst(unittest.TestCase):
         """Test that name lookup is case-sensitive."""
         with pytest.raises(ValueError):
             get_adv_estimator_fn("GAE")  # Different case
+
+    def test_get_adv_estimator_fn_qae_aliases(self):
+        """QAE should be retrievable via both the paper-style and lowercase names."""
+        register_adv_est("QAE")(compute_qae_outcome_advantage)
+        register_adv_est("qae")(compute_qae_outcome_advantage)
+        qae_upper = get_adv_estimator_fn("QAE")
+        qae_lower = get_adv_estimator_fn("qae")
+        assert qae_upper is compute_qae_outcome_advantage
+        assert qae_lower is compute_qae_outcome_advantage
 
 
 def test_multi_turn_compute_gae_advantage_return():
@@ -311,6 +323,66 @@ def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+def test_qae_hard_and_easy_query_gate():
+    token_level_rewards = torch.tensor(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array([0, 0, 1, 1, 1], dtype=np.int64)
+
+    class _Config(dict):
+        def get(self, key, default=None):
+            return super().get(key, default)
+
+    advantages, returns = compute_qae_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        config=_Config(qae_quantile=0.4, qae_norm_by_std=False),
+    )
+
+    expected = torch.tensor(
+        [
+            [0.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [-1.0, -1.0],
+        ],
+        dtype=torch.float32,
+    )
+    assert torch.equal(advantages, expected)
+    assert torch.equal(returns, expected)
+
+
+def test_qae_singleton_group_produces_zero_advantage():
+    token_level_rewards = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array([7], dtype=np.int64)
+
+    class _Config(dict):
+        def get(self, key, default=None):
+            return super().get(key, default)
+
+    advantages, returns = compute_qae_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        config=_Config(qae_quantile=0.4, qae_norm_by_std=True),
+    )
+
+    expected = torch.zeros_like(token_level_rewards)
+    assert torch.equal(advantages, expected)
+    assert torch.equal(returns, expected)
 
 
 if __name__ == "__main__":

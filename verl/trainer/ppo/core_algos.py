@@ -22,6 +22,7 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
 from collections import defaultdict
 from enum import Enum
+import math
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -105,6 +106,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    QAE = "QAE"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
@@ -356,6 +358,80 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.QAE)
+def compute_qae_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute Quantile Advantage Estimation (QAE) for outcome-only rewards.
+
+    This implements Eq. 3 from Wu et al. (2026), using the right-continuous
+    empirical K-quantile as the group baseline. For binary rewards, this reduces
+    to the hard/easy query gate in Eq. 4. For general scalar outcome rewards, we
+    keep the paper's empirical quantile definition.
+
+    Args:
+        token_level_rewards: Token-level rewards of shape ``(bs, response_length)``.
+        response_mask: Response mask of shape ``(bs, response_length)``.
+        index: Group ids that map responses belonging to the same prompt.
+        epsilon: Small value to avoid division by zero.
+        config: Algorithm config. Supports:
+            - ``qae_quantile`` in ``(0, 1)``, defaults to ``0.4``.
+            - ``qae_norm_by_std``, defaults to ``True``.
+
+    Returns:
+        A tuple of ``(advantages, returns)`` with the same shape as ``response_mask``.
+    """
+    scores = token_level_rewards.sum(dim=-1)
+    quantile = config.get("qae_quantile", 0.4) if config is not None else 0.4
+    normalize_by_std = config.get("qae_norm_by_std", True) if config is not None else True
+
+    if not 0.0 < quantile < 1.0:
+        raise ValueError(f"QAE requires algorithm.qae_quantile to be in (0, 1). Got: {quantile}")
+
+    id2score = defaultdict(list)
+    id2baseline = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+
+        for idx, grouped_scores in id2score.items():
+            if len(grouped_scores) == 0:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+            scores_tensor = torch.stack(grouped_scores)
+            if len(grouped_scores) == 1:
+                # A singleton group has no relative ranking signal, so QAE should
+                # produce zero advantage for that sole response.
+                id2baseline[idx] = scores_tensor[0]
+                id2std[idx] = scores.new_tensor(1.0)
+                continue
+
+            sorted_scores = torch.sort(scores_tensor).values
+            quantile_rank = max(math.ceil(quantile * len(grouped_scores)) - 1, 0)
+            id2baseline[idx] = sorted_scores[quantile_rank]
+            id2std[idx] = torch.std(scores_tensor)
+
+        for i in range(bsz):
+            scores[i] = scores[i] - id2baseline[index[i]]
+            if normalize_by_std:
+                scores[i] = scores[i] / (id2std[index[i]] + epsilon)
+
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+register_adv_est("qae")(compute_qae_outcome_advantage)
 
 
 @register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")
