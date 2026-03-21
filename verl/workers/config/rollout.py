@@ -41,10 +41,14 @@ class ArithmeticSamplingConfig(BaseConfig):
     group_size: Optional[int] = None
     seed: int = 0
     apply_to_validation: bool = False
+    probe_count: int = 0
+    pass_reward_threshold: float = 0.0
 
     def __post_init__(self):
         if self.group_size is not None and self.group_size < 1:
             raise ValueError("`group_size` must be a positive integer or null.")
+        if self.probe_count < 0:
+            raise ValueError("`probe_count` must be a non-negative integer.")
 
 
 def _coerce_arithmetic_sampling_config(value) -> ArithmeticSamplingConfig:
@@ -59,6 +63,8 @@ def _coerce_arithmetic_sampling_config(value) -> ArithmeticSamplingConfig:
         group_size=getattr(value, "group_size", None),
         seed=getattr(value, "seed", 0),
         apply_to_validation=getattr(value, "apply_to_validation", False),
+        probe_count=getattr(value, "probe_count", 0),
+        pass_reward_threshold=getattr(value, "pass_reward_threshold", 0.0),
     )
 
 

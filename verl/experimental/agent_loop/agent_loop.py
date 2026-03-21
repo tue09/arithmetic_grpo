@@ -173,6 +173,9 @@ class AgentLoopMetrics(BaseModel):
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
     num_preempted: int = -1  # -1 means not available
+    arithmetic_sampling_used: int = 0
+    arithmetic_sampling_avg_samples_per_group: float = 0.0
+    arithmetic_sampling_groups_triggered_fraction: float = 0.0
 
 
 class AgentLoopOutput(BaseModel):
@@ -428,6 +431,7 @@ class AgentLoopWorker:
 
         self.dataset_cls = get_dataset_class(config.data)
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self._warned_two_phase_missing_reward_loop = False
 
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
@@ -525,29 +529,190 @@ class AgentLoopWorker:
             rollout_ns.tolist() if rollout_ns is not None else None,
         )
 
-        tasks = []
-        for i in range(len(batch)):
-            trace_this_sample = i in traced_indices
-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-            request_sampling_params = self._maybe_apply_arithmetic_sampling(sampling_params, trajectory_info[i])
-            tasks.append(
-                asyncio.create_task(
-                    self._run_agent_loop(
-                        request_sampling_params,
-                        trajectory_info[i],
-                        trace=trace_this_sample,
-                        **kwargs,
+        if self._should_use_two_phase_arithmetic(validate=batch.meta_info.get("validate", False)):
+            outputs = await self._generate_sequences_with_two_phase_arithmetic(
+                batch=batch,
+                sampling_params=sampling_params,
+                trajectory_info=trajectory_info,
+                sample_keys=sample_keys.tolist(),
+                traced_indices=traced_indices,
+            )
+        else:
+            tasks = []
+            for i in range(len(batch)):
+                trace_this_sample = i in traced_indices
+                kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                request_sampling_params = self._maybe_apply_arithmetic_sampling(sampling_params, trajectory_info[i])
+                tasks.append(
+                    asyncio.create_task(
+                        self._run_agent_loop(
+                            request_sampling_params,
+                            trajectory_info[i],
+                            trace=trace_this_sample,
+                            **kwargs,
+                        )
                     )
                 )
-            )
-        outputs = await asyncio.gather(*tasks)
+            outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs, input_non_tensor_batch=batch.non_tensor_batch)
 
         return output
 
+    def _should_use_two_phase_arithmetic(self, *, validate: bool) -> bool:
+        arithmetic_config = self.rollout_config.arithmetic_sampling
+        if not arithmetic_config.enable:
+            return False
+        if validate and not arithmetic_config.apply_to_validation:
+            return False
+        if arithmetic_config.probe_count <= 0:
+            return False
+        if self.reward_loop_worker_handles is None:
+            if not self._warned_two_phase_missing_reward_loop:
+                logger.warning(
+                    "Two-phase arithmetic sampling requested, but no reward loop workers are available. "
+                    "Falling back to the original arithmetic behavior."
+                )
+                self._warned_two_phase_missing_reward_loop = True
+            return False
+        return True
+
+    async def _generate_sequences_with_two_phase_arithmetic(
+        self,
+        *,
+        batch: DataProto,
+        sampling_params: dict[str, Any],
+        trajectory_info: list[dict[str, Any]],
+        sample_keys: list[Any],
+        traced_indices: set[int],
+    ) -> list[_InternalAgentLoopOutput]:
+        group_indices_list = group_consecutive_indices(sample_keys)
+        group_tasks = [
+            asyncio.create_task(
+                self._run_two_phase_group(
+                    batch=batch,
+                    sampling_params=sampling_params,
+                    trajectory_info=trajectory_info,
+                    group_indices=group_indices,
+                    traced_indices=traced_indices,
+                )
+            )
+            for group_indices in group_indices_list
+        ]
+        group_results = await asyncio.gather(*group_tasks)
+
+        outputs = [output for group_outputs, _ in group_results for output in group_outputs]
+        arithmetic_counts = np.array([count for _, count in group_results], dtype=np.float32)
+        avg_samples_per_group = float(arithmetic_counts.mean()) if len(arithmetic_counts) > 0 else 0.0
+        groups_triggered_fraction = float((arithmetic_counts > 0).mean()) if len(arithmetic_counts) > 0 else 0.0
+
+        for output in outputs:
+            output.metrics.arithmetic_sampling_avg_samples_per_group = avg_samples_per_group
+            output.metrics.arithmetic_sampling_groups_triggered_fraction = groups_triggered_fraction
+
+        return outputs
+
+    async def _run_two_phase_group(
+        self,
+        *,
+        batch: DataProto,
+        sampling_params: dict[str, Any],
+        trajectory_info: list[dict[str, Any]],
+        group_indices: list[int],
+        traced_indices: set[int],
+    ) -> tuple[list[_InternalAgentLoopOutput], int]:
+        arithmetic_config = self.rollout_config.arithmetic_sampling
+        probe_count = min(arithmetic_config.probe_count, len(group_indices))
+        outputs: list[Optional[_InternalAgentLoopOutput]] = [None] * len(group_indices)
+
+        phase1_tasks = []
+        for batch_idx in group_indices[:probe_count]:
+            phase1_tasks.append(
+                asyncio.create_task(
+                    self._run_group_sample(
+                        batch=batch,
+                        sampling_params=sampling_params,
+                        trajectory=trajectory_info[batch_idx],
+                        batch_idx=batch_idx,
+                        trace=batch_idx in traced_indices,
+                        use_arithmetic=False,
+                    )
+                )
+            )
+        phase1_outputs = await asyncio.gather(*phase1_tasks)
+        for local_idx, output in enumerate(phase1_outputs):
+            outputs[local_idx] = output
+
+        should_fallback = probe_count < len(group_indices) and all(
+            not self._reward_passed(output.reward_score, arithmetic_config.pass_reward_threshold)
+            for output in phase1_outputs
+        )
+
+        arithmetic_used = 0
+        phase2_tasks = []
+        for local_idx, batch_idx in enumerate(group_indices[probe_count:], start=probe_count):
+            use_arithmetic = should_fallback
+            if use_arithmetic:
+                arithmetic_used += 1
+            phase2_tasks.append(
+                asyncio.create_task(
+                    self._run_group_sample(
+                        batch=batch,
+                        sampling_params=sampling_params,
+                        trajectory=trajectory_info[batch_idx],
+                        batch_idx=batch_idx,
+                        trace=batch_idx in traced_indices,
+                        use_arithmetic=use_arithmetic,
+                    )
+                )
+            )
+        if phase2_tasks:
+            phase2_outputs = await asyncio.gather(*phase2_tasks)
+            for local_idx, output in enumerate(phase2_outputs, start=probe_count):
+                outputs[local_idx] = output
+
+        finalized_outputs = []
+        for local_idx, output in enumerate(outputs):
+            assert output is not None
+            output.metrics.arithmetic_sampling_used = 1 if should_fallback and local_idx >= probe_count else 0
+            output.extra_fields["arithmetic_sampling_used"] = bool(output.metrics.arithmetic_sampling_used)
+            finalized_outputs.append(output)
+
+        return finalized_outputs, arithmetic_used
+
+    async def _run_group_sample(
+        self,
+        *,
+        batch: DataProto,
+        sampling_params: dict[str, Any],
+        trajectory: dict[str, Any],
+        batch_idx: int,
+        trace: bool,
+        use_arithmetic: bool,
+    ) -> _InternalAgentLoopOutput:
+        kwargs = {k: v[batch_idx] for k, v in batch.non_tensor_batch.items()}
+        request_sampling_params = self._maybe_apply_arithmetic_sampling(
+            sampling_params,
+            trajectory,
+            force_apply=use_arithmetic,
+        )
+        return await self._run_agent_loop(
+            request_sampling_params,
+            trajectory,
+            trace=trace,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _reward_passed(score: Optional[float], threshold: float) -> bool:
+        return score is not None and float(score) > threshold
+
     def _maybe_apply_arithmetic_sampling(
-        self, sampling_params: dict[str, Any], trajectory: dict[str, Any]
+        self,
+        sampling_params: dict[str, Any],
+        trajectory: dict[str, Any],
+        *,
+        force_apply: Optional[bool] = None,
     ) -> dict[str, Any]:
         arithmetic_config = self.rollout_config.get("arithmetic_sampling", {}) or {}
         if isinstance(arithmetic_config, dict):
@@ -561,9 +726,12 @@ class AgentLoopWorker:
             arithmetic_group_size = arithmetic_config.group_size
             arithmetic_seed = arithmetic_config.seed
 
-        if not arithmetic_enable:
-            return sampling_params
-        if trajectory["validate"] and not arithmetic_apply_to_validation:
+        if force_apply is None:
+            if not arithmetic_enable:
+                return sampling_params
+            if trajectory["validate"] and not arithmetic_apply_to_validation:
+                return sampling_params
+        elif not force_apply:
             return sampling_params
 
         group_size = arithmetic_group_size
@@ -948,6 +1116,22 @@ def compute_rollout_n(group_keys: list[Any]) -> list[int]:
     return rollout_ns
 
 
+def group_consecutive_indices(group_keys: list[Any]) -> list[list[int]]:
+    if not group_keys:
+        return []
+
+    groups = []
+    current_group = [0]
+    for idx in range(1, len(group_keys)):
+        if group_keys[idx] == group_keys[idx - 1]:
+            current_group.append(idx)
+        else:
+            groups.append(current_group)
+            current_group = [idx]
+    groups.append(current_group)
+    return groups
+
+
 def get_trajectory_info(step, sample_keys, validate, rollout_ns=None):
     """Get trajectory info.
 
@@ -1142,6 +1326,18 @@ class AgentLoopManager:
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
         t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
         num_preempted = np.array([metric["num_preempted"] for chunk in metrics for metric in chunk])
+        arithmetic_sampling_used = np.array(
+            [metric.get("arithmetic_sampling_used", 0) for chunk in metrics for metric in chunk],
+            dtype=np.float32,
+        )
+        arithmetic_sampling_avg_samples_per_group = np.array(
+            [metric.get("arithmetic_sampling_avg_samples_per_group", 0.0) for chunk in metrics for metric in chunk],
+            dtype=np.float32,
+        )
+        arithmetic_sampling_groups_triggered_fraction = np.array(
+            [metric.get("arithmetic_sampling_groups_triggered_fraction", 0.0) for chunk in metrics for metric in chunk],
+            dtype=np.float32,
+        )
         timing["agent_loop/num_preempted/min"] = num_preempted.min()
         timing["agent_loop/num_preempted/max"] = num_preempted.max()
         timing["agent_loop/num_preempted/mean"] = num_preempted.mean()
@@ -1151,6 +1347,14 @@ class AgentLoopManager:
         timing["agent_loop/tool_calls/min"] = t_tool_calls.min()
         timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
         timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
+        timing["agent_loop/arithmetic_sampling/used_sample_mean"] = arithmetic_sampling_used.mean()
+        timing["agent_loop/arithmetic_sampling/used_sample_total"] = arithmetic_sampling_used.sum()
+        timing["agent_loop/arithmetic_sampling/avg_samples_per_group"] = (
+            arithmetic_sampling_avg_samples_per_group.mean()
+        )
+        timing["agent_loop/arithmetic_sampling/groups_triggered_fraction"] = (
+            arithmetic_sampling_groups_triggered_fraction.mean()
+        )
 
         # batch sequence generation is bounded by the slowest sample
         slowest = np.argmax(t_generate_sequences + t_tool_calls)

@@ -69,6 +69,10 @@ VALIDATION_DATA_SOURCE_GROUPS = {
     "aime23_24_25": ("aime23", "aime24", "aime25"),
 }
 
+VALIDATION_DATA_SOURCE_AVERAGES = {
+    "aime23_24_25_avg": ("aime23", "aime24", "aime25"),
+}
+
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
@@ -646,6 +650,27 @@ class RayPPOTrainer:
             grouped_metrics = process_validation_metrics(grouped_data_sources, grouped_sample_uids, grouped_infos_dict)
             if group_name in grouped_metrics:
                 data_src2var2metric2val[group_name] = grouped_metrics[group_name]
+
+        for avg_name, members in VALIDATION_DATA_SOURCE_AVERAGES.items():
+            member_metrics = [data_src2var2metric2val[m] for m in members if m in data_src2var2metric2val]
+            if not member_metrics:
+                continue
+
+            avg_var2metric2val = defaultdict(dict)
+            all_var_names = set().union(*(metric.keys() for metric in member_metrics))
+            for var_name in all_var_names:
+                all_metric_names = set().union(*(metric.get(var_name, {}).keys() for metric in member_metrics))
+                for metric_name in all_metric_names:
+                    vals = [
+                        float(metric[var_name][metric_name])
+                        for metric in member_metrics
+                        if var_name in metric and metric_name in metric[var_name]
+                    ]
+                    if vals:
+                        avg_var2metric2val[var_name][metric_name] = float(np.mean(vals))
+
+            if avg_var2metric2val:
+                data_src2var2metric2val[avg_name] = avg_var2metric2val
 
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
