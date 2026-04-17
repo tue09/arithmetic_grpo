@@ -209,3 +209,9 @@ echo "ARITHMETIC_PASS_REWARD_THRESHOLD=$ARITHMETIC_PASS_REWARD_THRESHOLD"
     trainer.total_epochs=${TOTAL_EPOCHS:-20} \
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS:-2000} \
     "$@"
+
+
+
+
+Open User Setting
+
